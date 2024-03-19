@@ -1,0 +1,501 @@
+﻿Program.Sub.ScreenSU.Start
+Program.Sub.ScreenSU.End
+
+Program.Sub.Preflight.Start
+V.Global.sLastFONumber.Declare
+v.Global.sDir.Declare
+Program.Sub.Preflight.End
+
+Program.Sub.Main.Start
+F.Intrinsic.Control.Try
+
+'RRC 06/07/22 MOD 10/03/22
+'RRC MOD 08/16/23
+
+'Complete rewrite, optimization, and added features. -SS 12/6/23
+'This forecasting script was orignially written with UDTs and recordsets. It received a complete rewrite to use datatables, dictionaries and dataviews. During the rewrite I also added capability for it to handle parts that can be sold on their own and be a part of a BOM. for example the user forecasts that they will sell 100 replacement iphone screens in december and will also sell 500 iphones which require the screens to be made. Another thing to note is the method in which we are calculating the qty required has changed. We are first calculating the QTY required per part per itteration and then getting the list of parts that are required. Then we are building a psuedo MRP view of the part. We then loop chrologically through that MRP and calculate any QTY required at each entry. Due to limitations with the core UnattendedForecastMaintenance program, we are going to prevent scheduleing two forecast WOs for the same part on the same day. We are also assuming that any job requirements take place before the first forecast requirments are set. With how it is currently written, if the user does have job requirments far out into the future then the program could over forecast. -SS 12/6/23
+
+
+V.Local.sError.Declare
+V.Local.sDate.Declare(String)
+V.Local.dDate.Declare(Date)
+V.Local.sFile.Declare(String)
+V.Local.sRouterFile.Declare
+V.Local.bFileExists.Declare(Boolean)
+V.Local.iFlag.Declare(Long,0)
+V.Local.iFlag0.Declare(Long)
+V.Local.iLoop.Declare(Long)
+V.Local.sCWRet.Declare(String)
+v.Local.sSQL.Declare
+V.Local.iCnt.Declare
+V.Local.iCnt2.Declare
+V.Local.iCnt3.Declare
+V.Local.sPart.Declare
+V.Local.sPartLoc.Declare
+V.Local.sLoc.Declare
+V.Local.iMonth.Declare
+V.Local.iYear.Declare
+V.Local.fQtyReq.Declare
+V.Local.fQtyMultple.Declare
+V.Local.fStartingBalance.Declare
+V.Local.fHold.Declare
+V.Local.fRemainingBalance.Declare
+V.Local.iKeyTime.Declare
+V.Local.iKeySeq.Declare
+V.Local.sPartDesc.Declare
+V.Local.dDateReq.Declare
+V.Local.sKeyTime.Declare
+V.Local.fQTY.Declare
+V.Local.iNegativeLoop.Declare
+V.Local.sMessage.Declare
+V.Local.sNoRouters.Declare
+V.Local.sPLDKey.Declare
+V.Local.sDateReq.Declare
+V.Local.iLoop2.Declare
+v.Local.bExist.Declare
+
+'Create/Open Connection
+F.ODBC.Connection!Conx.opencompanyconnection(90)
+
+F.Intrinsic.Control.If(V.Ambient.IsInTaskScheduler.not)
+	f.Intrinsic.UI.InvokeWaitDialog("Init Upload")
+F.Intrinsic.Control.EndIf
+
+'RDF ADDED - 9th September
+F.Global.Callwrapper.New("CW6725","Manufacturing.UnattendedForecastMaintenance")
+F.Global.CallWrapper.Run("CW6725")
+F.Global.CallWrapper.GetProperty("CW6725","Status",V.Local.sCWRet)
+
+F.Intrinsic.String.Build("Initial Manufacturing.UnattendedForecastMaintenance Completed: {0}",V.Local.sCWRet,V.Local.sMessage)
+f.Intrinsic.Control.CallSub("Logging","Message",V.Local.sMessage)
+
+F.Intrinsic.Control.CallSub("GetInventoryPartInfo")
+
+
+'Delete previous Router missed list
+F.Intrinsic.String.Build("{0}\Custom\6725\{1}\Logs\",V.Caller.GlobalDir,V.Caller.CompanyCode,V.Global.sDir)
+F.Intrinsic.String.Build("{0}\FCROUTERSMISSED_6725.txt",V.Global.sDir,V.Local.sRouterFile)
+F.Intrinsic.File.Exists(V.Local.sRouterFile,V.Local.bFileExists)
+F.Intrinsic.Control.If(V.Local.bFileExists,=,True)
+	F.Intrinsic.File.DeleteFile(V.Local.sRouterFile)
+F.Intrinsic.Control.EndIf
+'F.Intrinsic.File.String2File(V.Local.sRouterFile,"Routers Missed List:")
+
+'Set iloop to 1 then count up ever loop of the doUntil 
+V.Local.iLoop.Set(1)
+
+'get last Forcast WO number from the initial upload. We will need to delete SPECIFIC records in the FORECAST_REQ table with a higher Forcast number than this after every iteration of the do until loop. This is because the Core Manufacturing.UnattendedForecastMaintenance prorgam puts aditional requirements in there that we dont need. Except for the ones it puts in there for the initial upload.
+F.ODBC.Connection!Conx.ExecuteandReturn("select TOP 1 RTRIM(FO_NUMBER) from FORECAST_REQ order by FO_NUMBER DESC",V.Global.sLastFONumber)
+
+V.Local.dDate.Set(V.Ambient.Date)
+F.Intrinsic.String.Format(V.Ambient.Date,"yyyymmdd",V.Local.sDate)
+
+F.Intrinsic.Control.DoUntil(V.Local.iLoop,=,0)
+	V.Local.iFlag0.Set(0)
+	
+	F.Intrinsic.Control.If(V.Ambient.IsInTaskScheduler.not)
+		f.Intrinsic.UI.InvokeWaitDialog(v.Local.iLoop)
+	F.Intrinsic.Control.EndIf
+	
+	'Pulling in requirements from forecast WOs already created
+	F.Data.DataTable.CreateFromSQL("dtReqComp","Conx","Select RTRIM(FO_PART) as PART, RTRIM(FO_LOCN) as LOC, RTRIM(FO_PART) + RTRIM(FO_LOCN) as PartLoc, SUM(FO_QTY_ORD) AS FO_QTY_ORD99, Cast(1 as bit) as keep from FORECAST_REQ where FO_SEQ>='990000'  GROUP BY FO_PART, FO_LOCN;",True)
+	
+#Region "Dictionary Fills"
+
+	'Part Description
+	F.Data.Datatable.AddColumn("dtReqComp","DESCRIPTION","string","")
+	F.Data.DataTable.FillFromDictionary("dtReqComp","dictDesc","PartLoc","DESCRIPTION")
+
+	'Part INV_QTY_ONHAND
+	F.Data.Datatable.AddColumn("dtReqComp","INV_QTY_ONHAND","Float",0.00)
+	F.Data.DataTable.FillFromDictionary("dtReqComp","dictQtyOH","PartLoc","INV_QTY_ONHAND")
+	
+	'Part INV_QTY_ONORDER_WO
+	F.Data.Datatable.AddColumn("dtReqComp","INV_QTY_ONORDER_WO","Float",0.00)
+	F.Data.DataTable.FillFromDictionary("dtReqComp","dictQtyOWO","PartLoc","INV_QTY_ONORDER_WO")
+	
+	'Part INV_QTY_ONORDER_PO
+	F.Data.Datatable.AddColumn("dtReqComp","INV_QTY_ONORDER_PO","Float",0.00)
+	F.Data.DataTable.FillFromDictionary("dtReqComp","dictQtyOPO","PartLoc","INV_QTY_ONORDER_PO")
+	
+	'Part INV_QTY_REQUIRED
+	F.Data.Datatable.AddColumn("dtReqComp","INV_QTY_REQUIRED","Float",0.00)
+	F.Data.DataTable.FillFromDictionary("dtReqComp","dictQtyINVREQ","PartLoc","INV_QTY_REQUIRED")
+	
+	'Part INV_QTY_REORDER (reorder point)
+	F.Data.Datatable.AddColumn("dtReqComp","INV_QTY_REORDER","Float",0.00)
+	F.Data.DataTable.FillFromDictionary("dtReqComp","dictQtyReOrd","PartLoc","INV_QTY_REORDER")
+
+	'Part INV_QTY_ORDER (order qty)
+	F.Data.Datatable.AddColumn("dtReqComp","INV_QTY_ORDER","Float",0.00)
+	F.Data.DataTable.FillFromDictionary("dtReqComp","dictQtyOrder","PartLoc","INV_QTY_ORDER")
+
+#End Region ' Dictionary Fills from INVENTORY_MSTR
+	
+	'QTY_ORDER.FORECAST_HEADER  (this is the qty on forecast WO Demanded by other WOs)
+	F.Data.Datatable.AddColumn("dtReqComp","QTY_FOREHD","Float",0.00)
+	F.Data.Dictionary.CreateFromSQL("dictQtyFHD","conx","select RTRIM(PART) + RTRIM(LOCATION) as PartLoc, SUM(QTY_ORDER) AS QTY_FOREHD from FORECAST_HEADER Group BY PART, LOCATION")
+	F.Data.Dictionary.SetDefaultReturn("dictQtyFHD",0.00)
+	F.Data.DataTable.FillFromDictionary("dtReqComp","dictQtyFHD","PartLoc","QTY_FOREHD")
+	F.Data.Dictionary.Close("dictQtyFHD")
+	
+	'FO_QTY_ORD.FORECAST_REQ  where FO_SEQ = '000000' (this is the qty req that is going to be sold directly... also from forecast WO )
+	F.Data.Datatable.AddColumn("dtReqComp","FO_QTY_ORD0000","Float",0.00)
+	F.Data.Dictionary.CreateFromSQL("dictQty000","conx","Select RTRIM(FO_PART) + RTRIM(FO_LOCN)  as PartLoc, SUM(FO_QTY_ORD) AS FO_QTY_ORD0000 from FORECAST_REQ  where FO_SEQ = '000000'  GROUP BY FO_PART, FO_LOCN")
+	F.Data.Dictionary.SetDefaultReturn("dictQty000",0.00)
+	F.Data.DataTable.FillFromDictionary("dtReqComp","dictQty000","PartLoc","FO_QTY_ORD0000")
+	F.Data.Dictionary.Close("dictQty000")
+	
+	'Calc Current_QTY and QTY_REQ
+	F.Data.DataTable.AddExpressionColumn("dtReqComp","Current_QTY","Float","[INV_QTY_ONHAND] + [INV_QTY_ONORDER_WO] + [INV_QTY_ONORDER_PO] - [INV_QTY_REQUIRED] - [INV_QTY_REORDER]")
+	F.Data.DataTable.AddExpressionColumn("dtReqComp","QTY_REQ","Float","[FO_QTY_ORD99] + [FO_QTY_ORD0000] - [Current_QTY] - [QTY_FOREHD]")
+	'duplicating Current_QTY column so that the names match up with the lines table.
+	F.Data.DataTable.AddExpressionColumn("dtReqComp","QTY","Float","[Current_QTY]")
+
+	
+	'Filter to only rows that have a 
+	F.Data.DataView.Create("dtReqComp","dvReqComp",22,"QTY_REQ > 0","")
+	F.Data.DataView.ToDataTable("dtReqComp","dvReqComp","dtUpload",True)
+	F.Data.DataView.Close("dtReqComp","dvReqComp")
+	F.Data.DataTable.Close("dtReqComp")
+	
+	'Adding this column to the DT upload and making the default true so that when we merge to the Lines table, we know which row is our starting value.
+	F.Data.DataTable.AddColumn("dtUpload","INVENTORY_NET_START","Boolean",True)
+	
+	
+	F.Data.DataTable.CreateFromSQL("dtMRP0","conx","Select RTRIM(FO_PART) as PART, RTRIM(FO_LOCN) as LOC, FO_DATE_DUE as DATE_DUE, SUM(-1 * FO_QTY_ORD) as QTY, Cast(1 as bit) as DEMAND From V_FORECAST_REQ Group by PART, LOC, DATE_DUE UNION Select RTRIM(PART) as PART, RTRIM(LOCATION) as LOC, DATE_DUE, QTY_ORDER as QTY, Cast(0 as bit) as DEMAND from V_FORECAST_HEADER Order by PART, DATE_DUE ASC, QTY DESC",True)
+	F.Data.DataTable.AddExpressionColumn("dtMRP0","PartLoc","String","[PART] + [LOC]")
+	
+	F.Data.DataTable.AddColumn("dtMRP0","INVENTORY_NET_START","Boolean",False)
+	
+	
+	F.Data.DataTable.AddColumn("dtMRP0","QTY_REQ","Float",0.00)
+	F.Data.Dictionary.CreateFromDataTable("dictQtyRec","dtUpload","PartLoc","QTY_REQ")
+	F.Data.DataTable.FillFromDictionary("dtMRP0","dictQtyRec","PartLoc","QTY_REQ")
+	F.Data.Dictionary.Close("dictQtyRec")
+	
+	'Merge upload (header) table into MRP lines to use it by adding 1 aditional line for each part which will serve as the starting invenotry QTY for each part 
+	F.Data.DataTable.Merge("dtUpload","dtMRP0",False,2)
+	F.Data.DataTable.AcceptChanges("dtMRP0")
+	
+	
+	F.Data.Dictionary.CreateFromDataTable("dictKeep","dtUpload","PartLoc","keep")
+	F.Data.DataTable.AddColumn("dtMRP0","keep","Boolean",False)
+	F.Data.DataTable.FillFromDictionary("dtMRP0","dictKeep","PartLoc","keep")
+	F.Data.Dictionary.Close("dictKeep")
+
+	
+	F.Data.DataView.Create("dtMRP0","dvMRP0",22,"keep = True","PartLoc ASC, DATE_DUE ASC, QTY Desc")
+	F.Data.DataView.ToDataTable("dtMRP0","dvMRP0","dtMRP",True)
+	F.Data.DataTable.Close("dtMRP0")
+	F.Data.DataTable.RemoveColumn("dtMRP","keep")
+	
+	'INV_QTY_ORDER from inventory Master
+	F.Data.DataTable.AddColumn("dtMRP","INV_QTY_ORDER","Float",0.00)
+	F.Data.DataTable.FillFromDictionary("dtMRP","dictQtyOrder","PartLoc","INV_QTY_ORDER")
+	
+	F.Data.DataTable.AddColumn("dtMRP","BUFFER","Float",0.00)
+	F.Data.DataTable.AddColumn("dtMRP","ADDED_LINE_QTY","Float",0.00)
+	F.Data.DataTable.AddExpressionColumn("dtMRP","QTY_RUNNING_TOTAL","Float","[QTY] + [BUFFER] + [ADDED_LINE_QTY]")
+	F.Data.DataTable.setValueOnNextLine("dtMRP","QTY_RUNNING_TOTAL","BUFFER","PartLoc")
+	
+	F.Data.DataTable.AddExpressionColumn("dtMRP","Negative","Boolean","IIF([QTY_RUNNING_TOTAL] < '0',  IIF(INVENTORY_NET_START = 'True', False, True), False)")
+	
+	'Calculating the Running total for how much we are adding this iteration
+	F.Data.DataTable.AddColumn("dtMRP","BUFFER2","Float",0.00)
+	F.Data.DataTable.AddExpressionColumn("dtMRP","QTY_RUNNING_THIS_LOOP","Float","[BUFFER2] + [ADDED_LINE_QTY]")
+	F.Data.DataTable.setValueOnNextLine("dtMRP","QTY_RUNNING_THIS_LOOP","BUFFER2","PartLoc")
+
+	F.Data.DataTable.Create("dtMRPNew",True)
+	F.Data.DataTable.AddColumn("dtMRPNew","PART","String","")
+	F.Data.DataTable.AddColumn("dtMRPNew","LOC","String","")
+	F.Data.DataTable.AddColumn("dtMRPNew","PartLoc","String","")
+	F.Data.DataTable.AddColumn("dtMRPNew","REQUIRED","Date")
+	F.Data.DataTable.AddColumn("dtMRPNew","QUANTITY","Float",0.00)
+	
+	F.Data.Dictionary.CreateFromSQL("dictPLD","conx","Select RTRIM(PART) + RTRIM(LOCATION) + Cast(DATE_DUE as Char(10)) as PLD, Cast(1 as bit) as Supply from V_FORECAST_HEADER")
+	F.Data.Dictionary.SetDefaultReturn("dictPLD",false)
+						
+	F.Intrinsic.Control.For(V.Local.iCnt,0,V.DataTable.dtMRP.RowCount--,1)
+		F.Intrinsic.Control.If(V.DataTable.dtMRP(V.Local.iCnt).Negative!fieldval)
+			F.Intrinsic.Control.If(V.DataTable.dtMRP(V.Local.iCnt).QTY_REQ!fieldval,>,V.DataTable.dtMRP(V.Local.iCnt).BUFFER2!fieldval)
+				'We need to add a new row, we are negative, and we have not yet met the QTY_REQ calculated from the overall MRP dataset
+				F.Intrinsic.Math.Abs(V.DataTable.dtMRP(V.Local.iCnt).QTY_RUNNING_TOTAL!fieldval,V.Local.fQTY)
+				F.Intrinsic.Control.If(V.DataTable.dtMRP(V.Local.iCnt).INV_QTY_ORDER!fieldval,<>,0)
+					'Account for if the part has an efficient order qty.
+					F.Intrinsic.Math.Div(V.Local.fQTY,V.DataTable.dtMRP(V.Local.iCnt).INV_QTY_ORDER!fieldval,V.Local.fQtyMultple)
+					F.Intrinsic.Math.Ceiling(V.Local.fQtyMultple,V.Local.fQtyMultple)
+					F.Intrinsic.Math.Mult(V.DataTable.dtMRP(V.Local.iCnt).INV_QTY_ORDER!fieldval,V.Local.fQtyMultple,V.Local.fQTY)
+				F.Intrinsic.Control.EndIf
+							
+				V.Local.dDateReq.Set(V.DataTable.dtMRP(V.Local.iCnt).DATE_DUE!fieldval)
+				V.Local.iLoop2.Set(1)
+				F.Intrinsic.Control.DoUntil(V.Local.iLoop2,=,0)
+					F.Intrinsic.String.Build("{0}{1}",V.DataTable.dtMRP(V.Local.iCnt).PartLoc!FieldVal,V.Local.dDateReq.FORMATYYYY-MM-DD,V.Local.sPLDKey)
+					F.Intrinsic.Control.If(V.Dictionary.dictPLD![V.Local.sPLDKey])
+						'There is already a Forecast Order with the same Part+loc+DueDate, so we need to move back in time 1 day and try again.
+						F.Intrinsic.Date.DateAdd("D",-1,V.Local.dDateReq,V.Local.dDateReq)
+						F.Intrinsic.Math.Add(V.Local.iLoop2,1,V.Local.iLoop2)
+					F.Intrinsic.Control.Else
+						'Exit loop and add dictionary value and reset iloop2 value
+						F.Data.Dictionary.AddItem("dictPLD",V.Local.sPLDKey,True)
+						V.Local.iLoop2.Set(0)
+					F.Intrinsic.Control.EndIf
+				F.Intrinsic.Control.Loop
+				
+				F.Data.DataTable.AddRow("dtMRPNew","PART",V.DataTable.dtMRP(V.Local.iCnt).PART!fieldval,"LOC",V.DataTable.dtMRP(V.Local.iCnt).LOC!fieldval,"PartLoc",V.DataTable.dtMRP(V.Local.iCnt).PartLoc!fieldval,"REQUIRED",V.Local.dDateReq,"QUANTITY",V.Local.fQTY)
+				F.Data.DataTable.SetValue("dtMRP",V.Local.iCnt,"ADDED_LINE_QTY",V.Local.fQTY)
+				F.Data.DataTable.setValueOnNextLine("dtMRP","QTY_RUNNING_TOTAL","BUFFER","PartLoc")
+				F.Data.DataTable.setValueOnNextLine("dtMRP","QTY_RUNNING_THIS_LOOP","BUFFER2","PartLoc")
+			F.Intrinsic.Control.EndIf
+		F.Intrinsic.Control.EndIf
+	F.Intrinsic.Control.Next(V.Local.iCnt)
+	
+	F.Data.Dictionary.Close("dictPLD")
+	'Group the new lines together by month.... *** we are not actually doing this right now....
+	
+	
+	'Pulling in the Part Desc column using the PartLoc Keyinto the Lines table
+	F.Data.DataTable.AddColumn("dtMRPNew","Description","String","")
+	F.Data.DataTable.FillFromDictionary("dtMRPNew","dictDesc","PartLoc","Description")
+	
+	'Remove lines from both header and lines tables that do not have a router in V_ROUTER_HEADER
+	F.Data.DataTable.AddColumn("dtMRPNew","HAS_ROUTER","Boolean",false)
+	F.Data.Dictionary.CreateFromSQL("dictRouter","conx","Select RTRIM(ROUTER), Cast(1 as bit) from V_ROUTER_HEADER")
+	F.Data.Dictionary.SetDefaultReturn("dictRouter",false)
+	F.Data.DataTable.FillFromDictionary("dtMRPNew","dictRouter","PART","HAS_ROUTER")
+	F.Data.Dictionary.Close("dictRouter")
+	
+	'Filter by which Parts contain a router. 
+	F.Data.DataView.Create("dtMRPNew","dvLines",22,"HAS_ROUTER = True and QUANTITY > 0","")
+	F.Data.DataView.ToDataTable("dtMRPNew","dvLines","dtFinalLines",True)
+	
+	'Spit out a list of Parts that do not contain Routers and so we will be skipping them in the callwrapper
+	F.Data.DataView.Create("dtMRPNew","dvNoRouter",22,"HAS_ROUTER = False and QUANTITY > 0","")
+	F.Data.DataView.ToString("dtMRPNew","dvNoRouter",",",V.Ambient.NewLine,V.Local.sNoRouters)
+	F.Data.DataView.Close("dtMRPNew","dvNoRouter")
+	f.Intrinsic.File.Exists(V.Local.sRouterFile,v.Local.bExist)
+	f.Intrinsic.Control.If(v.Local.bExist.Not)
+		F.Intrinsic.File.String2File(V.Local.sRouterFile,V.Local.sNoRouters)
+	F.Intrinsic.Control.Else
+		F.Intrinsic.File.Append2FileNewLine(V.Local.sRouterFile,V.Local.sNoRouters)
+	f.Intrinsic.Control.EndIf
+	
+	
+	V.Local.iFlag0.Set(0)
+	
+	V.Local.sPartLoc.Set("")
+	V.Local.iKeyTime.Set(0)
+	F.ODBC.Connection!Conx.Execute("Delete from FORECAST_IMPORT_LINE")
+	F.ODBC.Connection!Conx.Execute("Delete from FORECAST_IMPORT_HDR")
+	F.Intrinsic.Control.For(V.Local.iCnt3,V.DataTable.dtFinalLines.RowCount--,0,-1)
+		F.Intrinsic.Control.If(V.Local.sPartLoc,<>,V.DataTable.dtFinalLines(V.Local.iCnt3).PartLoc!fieldval)
+			V.Local.iFlag0.Set(1)
+		
+			'new part, need to make a header record
+			V.Local.sPartLoc.Set(V.DataTable.dtFinalLines(V.Local.iCnt3).PartLoc!fieldval)
+			F.Intrinsic.Math.Add(V.Local.iKeyTime,1,V.Local.iKeyTime)
+			F.Intrinsic.String.LPad(V.Local.iKeyTime.String,"0",8,V.Local.sKeyTime)
+			V.Local.sPart.Set(V.DataTable.dtFinalLines(V.Local.iCnt3).Part!fieldval)
+			V.Local.sLoc.Set(V.DataTable.dtFinalLines(V.Local.iCnt3).Loc!fieldval)
+			V.Local.sPartDesc.Set(V.DataTable.dtFinalLines(V.Local.iCnt3).Description!fieldval)
+			F.Intrinsic.String.Build("Insert Into FORECAST_IMPORT_HDR (KEY_DATE,KEY_TIME,PART,LOC,DESCRIPTION,START_DATE,INV_SOURCE,IMPORT_SOURCE) Values ('{0}','{1}','{2}','{3}','{4}','{5}','M','M')",V.Local.sDate,V.Local.sKeyTime,V.Local.sPart.PSQLFriendly,V.Local.sLoc.PSQLFriendly,V.Local.sPartDesc.PSQLFriendly,V.Local.dDate.PervasiveDate,V.Local.sSQL)
+			F.ODBC.Connection!Conx.Execute(V.Local.sSQL)
+			
+			'Reseting key seq since we are on a new part
+			V.Local.iKeySeq.Set(0)
+		F.Intrinsic.Control.EndIf
+		'add lines Record
+		F.Intrinsic.Math.Add(V.Local.iKeySeq,1,V.Local.iKeySeq)
+		V.Local.dDateReq.Set(V.DataTable.dtFinalLines(V.Local.iCnt3).REQUIRED!fieldval)
+		F.Intrinsic.String.Build("Insert Into FORECAST_IMPORT_LINE (KEY_DATE,KEY_TIME,KEY_SEQ,REQUIRED,QUANTITY,TYPE) Values ('{0}','{1}','{2}','{3}','{4}','1')",V.Local.sDate,V.Local.sKeyTime,V.Local.iKeySeq,V.Local.dDateReq.PervasiveDate,V.DataTable.dtFinalLines(V.Local.iCnt3).QUANTITY!fieldval,V.Local.sSQL)
+		F.ODBC.Connection!Conx.Execute(V.Local.sSQL)
+		
+	F.Intrinsic.Control.Next(V.Local.iCnt3)
+	
+	F.Data.DataTable.Close("dtUpload")
+	F.Data.DataView.Close("dtMRPNew","dvLines")
+	F.Data.DataTable.Close("dtMRPNew")
+	F.Data.DataTable.Close("dtMRP")
+	F.Data.DataTable.Close("dtFinalLines")
+
+'These are the column names we are concerned about for the table FORECAST_IMPORT_HDR and FORECAST_IMPORT_LINE
+'Header
+'KEY_DATE
+'KEY_TIME
+'PART
+'LOC
+'DESCRIPTION
+'START_DATE
+'INV_SOURCE  (hard coded as "M")
+'IMPORT_SOURCE (hard coded as "M")
+
+'Lines
+'KEY_DATE
+'KEY_TIME
+'KEY_SEQ
+'REQUIRED 
+'QUANTITY
+'TYPE	
+	
+	F.Intrinsic.Control.If(V.Local.iFlag0,=,0)
+		'We have no requirements
+		V.Local.iLoop.Set(0)
+	F.Intrinsic.Control.Else
+		
+		F.Global.Callwrapper.New("CW6725","Manufacturing.UnattendedForecastMaintenance")
+		F.Global.CallWrapper.Run("CW6725")
+		F.Global.CallWrapper.GetProperty("CW6725","Status",V.Local.sCWRet)
+		
+		F.Intrinsic.String.Build("Loop:{0} Manufacturing.UnattendedForecastMaintenance Completed: {1}",V.Local.iLoop.String,V.Local.sCWRet,V.Local.sMessage)
+		f.Intrinsic.Control.CallSub("Logging","Message",V.Local.sMessage)
+
+		F.Intrinsic.Math.Add(V.Local.iLoop,1,V.Local.iLoop)
+	F.Intrinsic.Control.EndIf
+
+		F.Intrinsic.UI.SleepMS(1000)
+	F.Intrinsic.Control.If(V.Global.sLastFONumber,<>,"")
+		F.Intrinsic.String.Build("DELETE FROM FORECAST_REQ WHERE fo_number>'{0}' and FO_SEQ='000000' AND FO_SUFFIX='000';",V.Global.sLastFONumber,V.Local.sSQL)
+		F.ODBC.Connection!Conx.Execute(V.Local.sSQL)
+	F.Intrinsic.Control.EndIf
+
+F.Intrinsic.Control.Loop
+
+F.ODBC.Connection!Conx.Execute("Delete from FORECAST_IMPORT_LINE")
+F.ODBC.Connection!Conx.Execute("Delete from FORECAST_IMPORT_HDR")
+f.Intrinsic.String.Build("DELETE FROM FORECAST_REQ WHERE fo_number>'{0}' and FO_SEQ='000000' AND FO_SUFFIX='000';",V.Global.sLastFONumber,v.Local.ssql)
+f.ODBC.Connection!conx.Execute(v.Local.sSQL)
+
+
+f.Intrinsic.Control.CallSub("CloseDictionaries")
+
+F.Intrinsic.String.Build("6725 Forecasting Req Completed. Ending Program",V.Local.sCWRet,V.Local.sMessage)
+f.Intrinsic.Control.CallSub("Logging","Message",V.Local.sMessage)
+
+'Close the Connection
+F.ODBC.Connection!Conx.Close
+F.Intrinsic.Control.End
+
+F.Intrinsic.Control.Catch
+	f.Intrinsic.Control.CallSub("Catching","sub",v.Ambient.CurrentSubroutine,"loop",V.Local.iLoop.String,"errorno",v.Ambient.ErrorNumber,"errordesc",v.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.Main.End
+
+Program.Sub.GetInventoryPartInfo.Start
+F.Intrinsic.Control.Try
+
+	'Pulling in inventory master information on what we currently have onhand and other information about the part. This is to calculate current net qty later. so excluding Forecasting WOs
+	F.Data.DataTable.CreateFromSQL("dtInventoryMstr","Conx","Select RTRIM(PART) + RTRIM(LOCATION) as PartLoc, RTRIM(DESCRIPTION) as DESCRIPTION, QTY_ONHAND as INV_QTY_ONHAND, QTY_ONORDER_WO as INV_QTY_ONORDER_WO, QTY_ONORDER_PO as INV_QTY_ONORDER_PO, QTY_REQUIRED as INV_QTY_REQUIRED, QTY_REORDER as INV_QTY_REORDER, QTY_ORDER as INV_QTY_ORDER FROM  INVENTORY_MSTR;",True)
+	
+	'Part Description
+	F.Data.Dictionary.CreateFromDataTable("dictDesc","dtInventoryMstr","PartLoc","DESCRIPTION")
+	F.Data.Dictionary.SetDefaultReturn("dictDesc","")
+
+	'Part INV_QTY_ONHAND
+	F.Data.Dictionary.CreateFromDataTable("dictQtyOH","dtInventoryMstr","PartLoc","INV_QTY_ONHAND")
+	F.Data.Dictionary.SetDefaultReturn("dictQtyOH",0.00)
+	
+	'Part INV_QTY_ONORDER_WO
+	F.Data.Dictionary.CreateFromDataTable("dictQtyOWO","dtInventoryMstr","PartLoc","INV_QTY_ONORDER_WO")
+	F.Data.Dictionary.SetDefaultReturn("dictQtyOWO",0.00)
+	
+	'Part INV_QTY_ONORDER_PO
+	F.Data.Dictionary.CreateFromDataTable("dictQtyOPO","dtInventoryMstr","PartLoc","INV_QTY_ONORDER_PO")
+	F.Data.Dictionary.SetDefaultReturn("dictQtyOPO",0.00)
+	
+	'Part INV_QTY_REQUIRED
+	F.Data.Dictionary.CreateFromDataTable("dictQtyINVREQ","dtInventoryMstr","PartLoc","INV_QTY_REQUIRED")
+	F.Data.Dictionary.SetDefaultReturn("dictQtyINVREQ",0.00)
+	
+	'Part INV_QTY_REORDER (reorder point)
+	F.Data.Dictionary.CreateFromDataTable("dictQtyReOrd","dtInventoryMstr","PartLoc","INV_QTY_REORDER")
+	F.Data.Dictionary.SetDefaultReturn("dictQtyReOrd",0.00)
+
+	'Part INV_QTY_ORDER (order qty)
+	F.Data.Dictionary.CreateFromDataTable("dictQtyOrder","dtInventoryMstr","PartLoc","INV_QTY_ORDER")
+	F.Data.Dictionary.SetDefaultReturn("dictQtyOrder",0.00)
+	
+
+	f.Data.DataTable.Close("dtInventoryMstr")
+
+F.Intrinsic.Control.Catch
+	f.Intrinsic.Control.CallSub("Catching","sub",v.Ambient.CurrentSubroutine,"loop",V.Local.iLoop.String,"errorno",v.Ambient.ErrorNumber,"errordesc",v.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.GetInventoryPartInfo.End
+
+Program.Sub.CloseDictionaries.Start
+F.Intrinsic.Control.Try
+
+'Close open Dictionaries
+F.Data.Dictionary.Close("dictDesc")
+F.Data.Dictionary.Close("dictQtyOH")
+F.Data.Dictionary.Close("dictQtyOWO")
+F.Data.Dictionary.Close("dictQtyOPO")
+F.Data.Dictionary.Close("dictQtyINVREQ")
+F.Data.Dictionary.Close("dictQtyReOrd")
+F.Data.Dictionary.Close("dictQtyOrder")
+
+F.Intrinsic.Control.Catch
+	f.Intrinsic.Control.CallSub("Catching","sub",v.Ambient.CurrentSubroutine,"loop",V.Local.iLoop.String,"errorno",v.Ambient.ErrorNumber,"errordesc",v.Ambient.ErrorDescription)
+F.Intrinsic.Control.EndTry
+Program.Sub.CloseDictionaries.End
+
+Program.Sub.Catching.Start
+V.Local.sFile.Declare
+v.Local.bExist.Declare
+V.Local.sString.Declare
+F.Intrinsic.Control.Try
+	F.Intrinsic.String.Build("{0}\Custom\6725\{1}\Logs\",V.Caller.GlobalDir,V.Caller.CompanyCode,V.Global.sDir)
+	f.Intrinsic.File.DirExists(v.Global.sDir,v.Local.bExist)
+	f.Intrinsic.Control.If(v.Local.bExist.Not)
+		f.Intrinsic.File.CreateDir(v.Global.sDir)
+	f.Intrinsic.Control.EndIf
+	
+	F.Intrinsic.String.Build("{0}\ErrorLogs.txt",V.Global.sDir,V.Local.sFile)
+	F.Intrinsic.String.Build("{4}: {0} {1} {2} {3}",V.Args.sub,V.Args.loop,V.Args.errorno,V.Args.errordesc,V.Ambient.Now,V.Local.sString)
+	
+	f.Intrinsic.File.Exists(V.Local.sFile,v.Local.bExist)
+	f.Intrinsic.Control.If(v.Local.bExist.Not)
+		F.Intrinsic.File.String2File(V.Local.sFile,V.Local.sString)
+	F.Intrinsic.Control.Else
+		F.Intrinsic.File.Append2FileNewLine(V.Local.sFile,V.Local.sString)
+	f.Intrinsic.Control.EndIf
+	
+	F.ODBC.Connection!Conx.Close
+	F.Intrinsic.Control.End
+	
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.End
+F.Intrinsic.Control.EndTry
+Program.Sub.Catching.End
+
+Program.Sub.Logging.Start
+V.Local.sFile.Declare
+v.Local.bExist.Declare
+V.Local.sString.Declare
+F.Intrinsic.Control.Try
+	F.Intrinsic.String.Build("{0}\Custom\6725\{1}\Logs\",V.Caller.GlobalDir,V.Caller.CompanyCode,V.Global.sDir)
+	f.Intrinsic.File.DirExists(v.Global.sDir,v.Local.bExist)
+	f.Intrinsic.Control.If(v.Local.bExist.Not)
+		f.Intrinsic.File.CreateDir(v.Global.sDir)
+	f.Intrinsic.Control.EndIf
+	
+	F.Intrinsic.String.Build("{0}\Logs.txt",V.Global.sDir,V.Local.sFile)
+	F.Intrinsic.String.Build("{2}: PID:{0}, {1}",V.Ambient.PID,V.Args.Message,V.Ambient.Now,V.Local.sString)
+	
+	f.Intrinsic.File.Exists(V.Local.sFile,v.Local.bExist)
+	f.Intrinsic.Control.If(v.Local.bExist.Not)
+		F.Intrinsic.File.String2File(V.Local.sFile,V.Local.sString)
+	F.Intrinsic.Control.Else
+		F.Intrinsic.File.Append2FileNewLine(V.Local.sFile,V.Local.sString)
+	f.Intrinsic.Control.EndIf
+		
+F.Intrinsic.Control.Catch
+	F.Intrinsic.Control.End
+F.Intrinsic.Control.EndTry
+Program.Sub.Logging.End
+
+Program.Sub.Comments.Start
+${$5$}$20.1.8615.24403$}$1
+${$6$}$sstanka$}$20231206101737364$}$mP+zz5Tw3sT2/nyap+FbWm4triMPqjXDgfnaHXy1hgeIKTydZVvcPOiB1HoiQJrAwPzTxog7210=
+Program.Sub.Comments.End
